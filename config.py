@@ -34,6 +34,15 @@ LOGIN_PASSWORD_SELECTOR = os.getenv("SMARTLEX24_LOGIN_PASSWORD_SELECTOR", "#log_
 LOGIN_SUBMIT_SELECTOR = os.getenv("SMARTLEX24_LOGIN_SUBMIT_SELECTOR", "#login button[type=submit]")
 LOGIN_ERROR_SELECTOR = os.getenv("SMARTLEX24_LOGIN_ERROR_SELECTOR", "#loginErrorMessageClient")
 
+# Banner cookie (OneTrust) che compare sopra il form e intercetta i click sul
+# bottone "Accedi" (scoperto al primo test reale, 28/09/2026): va chiuso
+# prima di cliccare submit. Bottone "Rifiuta tutto" (non "Accetta tutto",
+# per non lasciare tracce di consenso non necessarie), con fallback ad
+# "Accetta tutto" se il primo non è presente sulla pagina.
+COOKIE_REJECT_SELECTOR = os.getenv("SMARTLEX24_COOKIE_REJECT_SELECTOR", "#onetrust-reject-all-handler")
+COOKIE_ACCEPT_SELECTOR = os.getenv("SMARTLEX24_COOKIE_ACCEPT_SELECTOR", "#onetrust-accept-btn-handler")
+COOKIE_BANNER_WAIT_MS = int(os.getenv("SMARTLEX24_COOKIE_BANNER_WAIT_MS", "3000"))
+
 # Timeout e attese (il sito è una SPA pesante, con molte chiamate xhr in sequenza)
 NAV_TIMEOUT_MS = int(os.getenv("SMARTLEX24_NAV_TIMEOUT_MS", "45000"))
 LOGIN_WAIT_MS = int(os.getenv("SMARTLEX24_LOGIN_WAIT_MS", "8000"))
