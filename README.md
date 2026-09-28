@@ -59,20 +59,27 @@ conta è quello dopo il deploy.
 
 ## 4. Collegamento a Claude
 
-**Remoto (Render, Fly.io, Cloud Run...)**: qui c'è un passaggio in più
-rispetto agli altri due connettori — il **build command** deve installare
-anche il browser, non solo le dipendenze Python. Su Render, imposta:
+**Remoto (Render, Fly.io, Cloud Run...)**: a differenza degli altri due
+connettori, questo si distribuisce con **Docker** (c'è un `Dockerfile` nel
+repo), non con il buildpack Python nativo. Il motivo: `playwright install
+--with-deps` scarica anche librerie di sistema via `apt`, il che richiede
+permessi di root che l'ambiente di build standard di Render non concede
+("su: Authentication failure" se provi il buildpack nativo). Il
+`Dockerfile` usa invece l'immagine ufficiale `mcr.microsoft.com/playwright/
+python`, che ha già Chromium e le librerie necessarie pronte.
 
-- **Build Command**: `pip install -r requirements.txt && playwright install --with-deps chromium`
-- **Start Command**: `python server.py`
-- Variabili d'ambiente: `PORT` (di solito già gestita da Render),
-  `MCP_PATH=/un-percorso-segreto/mcp`, `SMARTLEX24_USERNAME`,
-  `SMARTLEX24_PASSWORD`
+Su Render, quando crei il Web Service:
+- **Runtime**: Docker (Render lo rileva automaticamente se c'è un
+  `Dockerfile` nella root del repo; se te lo chiede esplicitamente, scegli
+  "Docker" e non "Python 3")
+- Non servono Build Command / Start Command manuali: sono nel `Dockerfile`
+- Variabili d'ambiente: `MCP_PATH=/un-percorso-segreto/mcp`,
+  `SMARTLEX24_USERNAME`, `SMARTLEX24_PASSWORD` (`PORT` è gestita da Render)
 
 Chromium headless consuma più RAM dei connettori precedenti (che erano solo
 richieste HTTP): se il piano Render è troppo piccolo, il login potrebbe
-fallire per mancanza di memoria, non per un problema del codice — in quel
-caso serve un piano con più RAM.
+fallire per mancanza di memoria/CPU (timeout), non per un problema del
+codice — in quel caso serve un piano con più risorse.
 
 Poi in Claude: Impostazioni -> Connettori -> Aggiungi connettore personalizzato
 -> URL `https://tuo-host/un-percorso-segreto/mcp`.
