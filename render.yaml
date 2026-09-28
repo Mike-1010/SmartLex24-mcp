@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: smartlex24-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: MCP_PATH
+        sync: false
+      - key: SMARTLEX24_USERNAME
+        sync: false
+      - key: SMARTLEX24_PASSWORD
+        sync: false
