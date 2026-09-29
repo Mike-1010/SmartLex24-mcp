@@ -11,6 +11,13 @@ LOGIN_PAGE_URL = f"{BASE}/public/default.aspx?logout=true"
 # scoperto via DevTools il 28/09/2026.
 SEARCH_URL = "https://dwa.ilsole24ore.com/dir/api/BD.Search.BDSearchServiceREST.svc/PullSearch3"
 TOKEN_INFO_URL = "https://dwa.ilsole24ore.com/dir/api/BD.User.BDUserServiceREST.svc/GetTokenInfo"
+# Endpoint per il testo integrale di un documento, scoperto via DevTools il
+# 29/09/2026 aprendo la voce "Integrale" di un risultato: prende in ingresso
+# "documentId" (non "queryWord") e restituisce tra l'altro "TestoDoc" (HTML)
+# e "Blocked" (booleano: pare essere il vero indicatore di accesso negato
+# dall'abbonamento, a differenza di "visibile" nei risultati di ricerca, il
+# cui significato resta incerto).
+DOCUMENT_URL = "https://dwa.ilsole24ore.com/dir/api/BD.Document.BDDocumentServiceREST.svc/GetDocument"
 
 # Header richiesti dal gateway API (JsonORB) di dwa.ilsole24ore.com, scoperti
 # via DevTools il 29/09/2026: senza "jsonorb-apikey" (chiave dell'applicazione

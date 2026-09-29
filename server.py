@@ -13,7 +13,9 @@ successive, senza riaprire il browser ogni volta (finché resta valido).
 """
 import argparse
 import asyncio
+import html
 import os
+import re
 import sys
 import time
 from typing import Optional
@@ -28,13 +30,16 @@ Accesso a SmartLex24 (Il Sole 24 Ore) con le credenziali di abbonamento
 configurate sul server. Copre giurisprudenza, legge e prassi, approfondimenti
 professionali, secondo quanto incluso nell'abbonamento collegato.
 
-Usa `cerca_smartlex24` per le ricerche testuali.
+Usa `cerca_smartlex24` per le ricerche testuali e `leggi_documento_smartlex24`
+per il testo integrale di un documento trovato (passandogli il suo
+"idDocumento").
 
-ATTENZIONE - connettore sperimentale, in fase di prima verifica: la
-struttura dei risultati non è stata ancora interamente mappata (i campi
-esatti di ogni documento vanno controllati sui risultati reali). Il primo
-login di una sessione è lento (apre un vero browser per autenticarsi): le
-ricerche successive sono più rapide perché riusano la sessione già ottenuta.
+ATTENZIONE - connettore sperimentale, in fase di prima verifica: il campo
+"visibile" nei risultati di ricerca non è affidabile per sapere se un
+documento è incluso nell'abbonamento (usa invece "accesso_negato" restituito
+da leggi_documento_smartlex24). Il primo login di una sessione è lento (apre
+un vero browser per autenticarsi): le ricerche successive sono più rapide
+perché riusano la sessione già ottenuta.
 """
 
 mcp = FastMCP(
@@ -200,9 +205,9 @@ def _normalizza_documento(d: dict) -> dict:
     NOTA: il campo "visibile" non è ancora interpretabile con certezza (non
     segue data/famiglia/tipo, ma il formato del risultato) - non affidarti al
     suo valore per decidere se il testo integrale è incluso nell'abbonamento.
-    "idDocumento" a 0 o assente significa che non è comunque possibile aprire
-    il documento (nessuno strumento di lettura è ancora disponibile in questo
-    connettore).
+    Usa invece "accesso_negato" restituito da leggi_documento_smartlex24.
+    "idDocumento" a 0 o assente significa che il documento non può comunque
+    essere aperto con leggi_documento_smartlex24.
     """
     testo = d.get("abstract") or d.get("text2") or d.get("Abstract") or ""
     troncato = len(testo) > 800
@@ -218,6 +223,96 @@ def _normalizza_documento(d: dict) -> dict:
         "visibile": d.get("visibile"),
         "estratto": testo[:800] + "…" if troncato else testo,
         "estratto_troncato_qui": troncato,
+    }
+
+
+def _html_a_testo(testo_html: str) -> str:
+    """Conversione minima da HTML a testo leggibile per il campo "TestoDoc"
+    (niente dipendenze esterne: solo tag più comuni + unescape entità)."""
+    if not testo_html:
+        return ""
+    testo = re.sub(r"<br\s*/?>", "\n", testo_html, flags=re.IGNORECASE)
+    testo = re.sub(r"</p\s*>", "\n\n", testo, flags=re.IGNORECASE)
+    testo = re.sub(r"<[^>]+>", "", testo)
+    testo = html.unescape(testo)
+    return re.sub(r"\n{3,}", "\n\n", testo).strip()
+
+
+def _html_a_testo_inline(testo_html: str) -> str:
+    """Come sopra ma per campi di una riga (es. titoli): spazi al posto di
+    newline, spazi multipli collassati."""
+    if not testo_html:
+        return ""
+    testo = re.sub(r"<[^>]+>", " ", testo_html)
+    testo = html.unescape(testo)
+    return re.sub(r"\s{2,}", " ", testo).strip()
+
+
+async def _get_document(id_documento: str) -> dict:
+    try:
+        token = await ensure_session()
+    except LoginError as e:
+        return {"errore": str(e)}
+
+    # Struttura verificata via DevTools il 29/09/2026 cliccando "Integrale"
+    # su un risultato reale: endpoint e payload diversi da PullSearch3 (qui
+    # il campo è "documentId", non "queryWord").
+    payload = {
+        "documentId": str(id_documento),
+        "parameters": {
+            "references": False,
+            "checkUserPackages": True,
+            "staticToken": "",
+        },
+        "token": token,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "jsonorb-apikey": config.JSONORB_API_KEY,
+        "jsonorb-addcache": "false",
+        "Origin": config.API_ORIGIN,
+        "Referer": config.API_REFERER,
+    }
+    if _session_cookies:
+        headers["Cookie"] = _cookie_header(_session_cookies)
+
+    async with httpx.AsyncClient(timeout=config.TIMEOUT) as client:
+        try:
+            r = await client.post(config.DOCUMENT_URL, json=payload, headers=headers)
+        except httpx.HTTPError as e:
+            return {"errore": f"Impossibile raggiungere SmartLex24: {e}"}
+
+    if r.status_code in (401, 403):
+        global _session_token
+        _session_token = None
+        return {"errore": "Sessione scaduta, riprova: al prossimo tentativo verrà rifatto il login."}
+
+    if r.status_code != 200:
+        return {"errore": f"SmartLex24 ha risposto con errore {r.status_code}."}
+
+    try:
+        parsed = r.json()
+    except ValueError:
+        return {"errore": "Risposta inattesa da SmartLex24 (non JSON)."}
+
+    result = parsed.get("Result") or {}
+    if not result:
+        return {"errore": "Documento non trovato o risposta vuota."}
+
+    return {
+        "idDocumento": result.get("DocumentId"),
+        "titolo": _html_a_testo_inline(result.get("Text2") or "") or None,
+        "famiglia": result.get("Famiglia"),
+        "sottofamiglia": result.get("SottoFamiglia"),
+        # NOTA (29/09/2026): "Blocked" qui sembra essere il vero indicatore
+        # di accesso negato dall'abbonamento (a differenza di "visibile" nei
+        # risultati di ricerca, il cui significato resta incerto) - da
+        # confermare su un documento realmente fuori abbonamento.
+        "accesso_negato": bool(result.get("Blocked")),
+        "testo_integrale": _html_a_testo(result.get("TestoDoc") or ""),
+        "id_precedente": result.get("DocumentIdPrev") or None,
+        "id_successivo": result.get("DocumentIdNext") or None,
     }
 
 
@@ -312,10 +407,11 @@ async def _search(query: str, n: int) -> dict:
         "totale_trovati": result.get("DocsFound", len(docs)),
         "did_you_mean": result.get("DidYouMean") or None,
         "risultati": [_normalizza_documento(d) for d in docs],
-        "nota": "Struttura dei risultati normalizzata da questo connettore "
-        "(vedi campo 'visibile' e 'idDocumento': il significato di 'visibile' "
-        "non è ancora confermato, e non esiste ancora uno strumento per "
-        "leggere il testo integrale di un documento).",
+        "nota": "Struttura dei risultati normalizzata da questo connettore. "
+        "Per leggere il testo integrale di un documento usa "
+        "leggi_documento_smartlex24 con il suo 'idDocumento' - il campo "
+        "'visibile' qui non è affidabile per sapere se è incluso "
+        "nell'abbonamento, usa 'accesso_negato' da quello strumento.",
     }
 
 
@@ -329,19 +425,38 @@ async def cerca_smartlex24(query: str, n: int = 10) -> dict:
     tipologia, data, famiglia, url, argomento, rank, visibile, estratto):
     alcuni possono essere null a seconda del tipo di documento. "n" viene
     sempre rispettato lato connettore (anche quando il sito restituisce più
-    righe del richiesto). Non esiste ancora uno strumento per leggere il
-    testo integrale di un documento: "estratto" è solo un'anteprima.
+    righe del richiesto). "estratto" è solo un'anteprima: per il testo
+    integrale usa leggi_documento_smartlex24 con l'"idDocumento" del
+    risultato che interessa.
 
     ATTENZIONE: connettore sperimentale, non ancora interamente verificato
-    (in particolare il significato del campo "visibile" e l'accesso al testo
-    integrale). Trattare i risultati come indicativi e verificarli sulla
-    fonte quando serve certezza.
+    (in particolare il significato del campo "visibile", da non usare per
+    sapere se il testo integrale è incluso nell'abbonamento - per quello usa
+    "accesso_negato" restituito da leggi_documento_smartlex24). Trattare i
+    risultati come indicativi e verificarli sulla fonte quando serve
+    certezza.
 
     Args:
         query: testo da cercare.
         n: numero massimo di risultati (default 10, max 20).
     """
     return await _search(query, n)
+
+
+@mcp.tool()
+async def leggi_documento_smartlex24(id_documento: str) -> dict:
+    """Legge il testo integrale di un documento SmartLex24, dato il suo
+    "idDocumento" (restituito da un risultato di cerca_smartlex24).
+
+    Se "accesso_negato" è true, il documento non è incluso nell'abbonamento
+    collegato (o non è stato possibile leggerlo) e "testo_integrale" sarà
+    vuoto: non trattare in quel caso una stringa vuota come "documento senza
+    contenuto".
+
+    Args:
+        id_documento: l'idDocumento di un risultato di cerca_smartlex24.
+    """
+    return await _get_document(id_documento)
 
 
 @mcp.tool()
