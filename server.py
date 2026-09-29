@@ -190,6 +190,37 @@ def _cookie_header(cookies: Optional[list]) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in (cookies or []))
 
 
+def _normalizza_documento(d: dict) -> dict:
+    """Unifica in un'unica struttura i due formati osservati nelle risposte
+    reali del 29/09/2026 (uno con tipologia/data/rank valorizzati e abstract
+    troncato con "...", l'altro con quei campi a null/0 ma un testo più
+    esteso in "text2"/abstract, spesso l'inizio della motivazione) - così chi
+    consuma i risultati non deve gestire due schemi diversi.
+
+    NOTA: il campo "visibile" non è ancora interpretabile con certezza (non
+    segue data/famiglia/tipo, ma il formato del risultato) - non affidarti al
+    suo valore per decidere se il testo integrale è incluso nell'abbonamento.
+    "idDocumento" a 0 o assente significa che non è comunque possibile aprire
+    il documento (nessuno strumento di lettura è ancora disponibile in questo
+    connettore).
+    """
+    testo = d.get("abstract") or d.get("text2") or d.get("Abstract") or ""
+    troncato = len(testo) > 800
+    return {
+        "idDocumento": d.get("idDocumento") or None,
+        "titolo": d.get("titolo") or d.get("title") or d.get("Title") or None,
+        "tipologia": d.get("tipologia") or None,
+        "data": d.get("data") if d.get("data") not in (None, "0001-01-01") else None,
+        "famiglia": d.get("famigliaCode") or d.get("famiglia") or None,
+        "url": d.get("url") or None,
+        "argomento": d.get("argomento") or None,
+        "rank": d.get("rank"),
+        "visibile": d.get("visibile"),
+        "estratto": testo[:800] + "…" if troncato else testo,
+        "estratto_troncato_qui": troncato,
+    }
+
+
 async def _search(query: str, n: int) -> dict:
     try:
         token = await ensure_session()
@@ -268,14 +299,23 @@ async def _search(query: str, n: int) -> dict:
         return {"errore": "Risposta inattesa da SmartLex24 (non JSON)."}
 
     result = parsed.get("Result", {}) or {}
-    docs = result.get("Documents", [])
+    docs = result.get("Documents", []) or []
+
+    # Il campo "rows" del payload non è sempre rispettato dal sito (osservato
+    # il 29/09/2026: righe annidate possono far superare il numero
+    # richiesto), quindi tagliamo qui in modo esplicito a "n effettivo", per
+    # rispettare quanto chiesto e limitare la dimensione della risposta.
+    n_effettivo = max(1, min(n, config.MAX_ROWS))
+    docs = docs[:n_effettivo]
+
     return {
         "totale_trovati": result.get("DocsFound", len(docs)),
         "did_you_mean": result.get("DidYouMean") or None,
-        "risultati": docs,
-        "nota": "Struttura dei risultati non ancora interamente mappata: "
-        "verifica i campi effettivi restituiti (idDocumento, idProvvedimento, "
-        "idFonte...) sui risultati reali di questa chiamata.",
+        "risultati": [_normalizza_documento(d) for d in docs],
+        "nota": "Struttura dei risultati normalizzata da questo connettore "
+        "(vedi campo 'visibile' e 'idDocumento': il significato di 'visibile' "
+        "non è ancora confermato, e non esiste ancora uno strumento per "
+        "leggere il testo integrale di un documento).",
     }
 
 
@@ -285,9 +325,17 @@ async def cerca_smartlex24(query: str, n: int = 10) -> dict:
     approfondimenti professionali, secondo l'abbonamento configurato sul
     server.
 
-    ATTENZIONE: connettore sperimentale, appena creato e non ancora
-    interamente verificato in tutti i suoi aspetti (struttura dei risultati,
-    eventuali filtri disponibili). Il primo utilizzo va trattato come test.
+    Ogni risultato è normalizzato con gli stessi campi (idDocumento, titolo,
+    tipologia, data, famiglia, url, argomento, rank, visibile, estratto):
+    alcuni possono essere null a seconda del tipo di documento. "n" viene
+    sempre rispettato lato connettore (anche quando il sito restituisce più
+    righe del richiesto). Non esiste ancora uno strumento per leggere il
+    testo integrale di un documento: "estratto" è solo un'anteprima.
+
+    ATTENZIONE: connettore sperimentale, non ancora interamente verificato
+    (in particolare il significato del campo "visibile" e l'accesso al testo
+    integrale). Trattare i risultati come indicativi e verificarli sulla
+    fonte quando serve certezza.
 
     Args:
         query: testo da cercare.
