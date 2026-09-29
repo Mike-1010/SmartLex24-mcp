@@ -195,6 +195,22 @@ def _cookie_header(cookies: Optional[list]) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in (cookies or []))
 
 
+def _ultimo_titolo_da_html(testo_html: str) -> Optional[str]:
+    """Il titolo/massima non è in un campo a sé (osservato il 29/09/2026): è
+    dentro un frammento HTML ("text2"/"Text2") con più blocchi - un'etichetta
+    tipo "Massima redazionale"/"Integrale" seguita dal titolo vero e proprio
+    in un <p> o <h1>. Prendiamo l'ULTIMO blocco <p>/<h1> trovato (di norma il
+    titolo, non l'etichetta), o tutto il testo spogliato dai tag se non ne
+    troviamo nessuno."""
+    if not testo_html:
+        return None
+    blocchi = re.findall(
+        r"<(?:h1|p)[^>]*>(.*?)</(?:h1|p)>", testo_html, flags=re.IGNORECASE | re.DOTALL
+    )
+    frammento = blocchi[-1] if blocchi else testo_html
+    return _html_a_testo_inline(frammento) or None
+
+
 def _normalizza_documento(d: dict) -> dict:
     """Unifica in un'unica struttura i due formati osservati nelle risposte
     reali del 29/09/2026 (uno con tipologia/data/rank valorizzati e abstract
@@ -213,7 +229,12 @@ def _normalizza_documento(d: dict) -> dict:
     troncato = len(testo) > 800
     return {
         "idDocumento": d.get("idDocumento") or None,
-        "titolo": d.get("titolo") or d.get("title") or d.get("Title") or None,
+        "titolo": (
+            d.get("titolo")
+            or d.get("title")
+            or d.get("Title")
+            or _ultimo_titolo_da_html(d.get("text2") or "")
+        ),
         "tipologia": d.get("tipologia") or None,
         "data": d.get("data") if d.get("data") not in (None, "0001-01-01") else None,
         "famiglia": d.get("famigliaCode") or d.get("famiglia") or None,
@@ -302,7 +323,7 @@ async def _get_document(id_documento: str) -> dict:
 
     return {
         "idDocumento": result.get("DocumentId"),
-        "titolo": _html_a_testo_inline(result.get("Text2") or "") or None,
+        "titolo": _ultimo_titolo_da_html(result.get("Text2") or ""),
         "famiglia": result.get("Famiglia"),
         "sottofamiglia": result.get("SottoFamiglia"),
         # NOTA (29/09/2026): "Blocked" qui sembra essere il vero indicatore
