@@ -69,7 +69,7 @@ async def _login_and_capture_token() -> tuple[str, list]:
 
     def _on_request(request):
         nonlocal captured_token
-        if captured_token or request.method != "POST":
+        if request.method != "POST":
             return
         if "dwa.ilsole24ore.com/dir/api/" not in request.url:
             return
@@ -78,6 +78,10 @@ async def _login_and_capture_token() -> tuple[str, list]:
         except Exception:
             data = None
         if isinstance(data, dict) and data.get("token"):
+            # NOTA (29/09/2026): non ci fermiamo al primo token visto - il
+            # sito sembra rigenerare/aggiornare il token con chiamate
+            # successive al login (es. RefreshToken); prendiamo sempre
+            # l'ULTIMO visto, presumendolo il più aggiornato/valido.
             captured_token = data["token"]
 
     async with async_playwright() as p:
@@ -144,8 +148,11 @@ async def _login_and_capture_token() -> tuple[str, list]:
             except PlaywrightTimeoutError:
                 pass
 
-            if not captured_token:
-                await page.wait_for_timeout(config.LOGIN_WAIT_MS)
+            # Attesa aggiuntiva SEMPRE (non solo se manca ancora un token):
+            # vogliamo dare tempo a un'eventuale chiamata di refresh/rinnovo
+            # del token, successiva al primo, di completarsi e sovrascrivere
+            # "captured_token" con il valore più aggiornato.
+            await page.wait_for_timeout(config.LOGIN_WAIT_MS)
         except PlaywrightTimeoutError as e:
             raise LoginError(f"Timeout durante il login: {e}") from e
         finally:
