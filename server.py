@@ -95,31 +95,23 @@ async def _login_and_capture_token() -> tuple[str, list]:
             await page.fill(config.LOGIN_USERNAME_SELECTOR, config.SMARTLEX24_USERNAME)
             await page.fill(config.LOGIN_PASSWORD_SELECTOR, config.SMARTLEX24_PASSWORD)
 
-            # Il banner cookie (OneTrust) copre il bottone "Accedi" e ne
-            # blocca il click: va chiuso prima. NOTA: Locator.is_visible()
-            # non aspetta (è un controllo istantaneo, il parametro timeout
-            # non ha effetto reale) - va usato wait_for(state="visible") per
-            # aspettare davvero la comparsa del banner prima di deciderne
-            # l'assenza.
-            for selector in (config.COOKIE_REJECT_SELECTOR, config.COOKIE_ACCEPT_SELECTOR):
-                try:
-                    btn = page.locator(selector)
-                    await btn.wait_for(state="visible", timeout=config.COOKIE_BANNER_WAIT_MS)
-                    await btn.click()
-                    break
-                except PlaywrightTimeoutError:
-                    continue
-
-            # Anche dopo aver cliccato il banner, l'overlay/filtro scuro di
-            # OneTrust può restare un istante prima di sparire dal DOM:
-            # aspettiamo che non intercetti più i click, invece di tentare
-            # subito il submit (che altrimenti fallirebbe di nuovo).
+            # Il widget cookie OneTrust (banner o, a volte, il Preference
+            # Center con un proprio overlay scuro "onetrust-pc-dark-filter")
+            # copre il bottone "Accedi" e ne blocca il click. Invece di
+            # inseguire quale dei due componenti OneTrust sta mostrando (i
+            # loro bottoni hanno id diversi), lo rimuoviamo proprio dal DOM:
+            # più robusto, non dipende da quale variante compare.
             try:
-                await page.locator("#onetrust-consent-sdk").wait_for(state="hidden", timeout=5000)
-            except PlaywrightTimeoutError:
+                await page.evaluate(
+                    "document.getElementById('onetrust-consent-sdk')?.remove()"
+                )
+            except Exception:
                 pass
 
-            await page.click(config.LOGIN_SUBMIT_SELECTOR)
+            # Rete di sicurezza: se per qualunque motivo un altro elemento
+            # dovesse comunque intercettare il click, forziamo il click
+            # bypassando il controllo "receives pointer events" di Playwright.
+            await page.click(config.LOGIN_SUBMIT_SELECTOR, force=True)
 
             try:
                 await page.wait_for_load_state("networkidle", timeout=config.NAV_TIMEOUT_MS)
