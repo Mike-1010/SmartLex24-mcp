@@ -296,6 +296,86 @@ async def cerca_smartlex24(query: str, n: int = 10) -> dict:
     return await _search(query, n)
 
 
+@mcp.tool()
+async def diagnostica_login() -> dict:
+    """Diagnostica: esegue il login e restituisce informazioni tecniche per
+    capire se è andato davvero a buon fine (URL finale della pagina, se
+    l'email dell'utente compare da qualche parte nella pagina, lunghezza e
+    inizio/fine del token catturato) - non fa nessuna ricerca. Da usare solo
+    per debug del connettore, non è pensato per l'utente finale."""
+    from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+
+    if not config.SMARTLEX24_USERNAME or not config.SMARTLEX24_PASSWORD:
+        return {"errore": "Credenziali non configurate."}
+
+    captured_token: Optional[str] = None
+    all_tokens_seen = []
+
+    def _on_request(request):
+        nonlocal captured_token
+        if request.method != "POST" or "dwa.ilsole24ore.com/dir/api/" not in request.url:
+            return
+        try:
+            data = request.post_data_json
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get("token"):
+            captured_token = data["token"]
+            all_tokens_seen.append({"url": request.url, "token_len": len(data["token"])})
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        try:
+            await page.goto(config.LOGIN_PAGE_URL, timeout=config.NAV_TIMEOUT_MS, wait_until="domcontentloaded")
+            await page.fill(config.LOGIN_USERNAME_SELECTOR, config.SMARTLEX24_USERNAME)
+            await page.fill(config.LOGIN_PASSWORD_SELECTOR, config.SMARTLEX24_PASSWORD)
+            try:
+                await page.evaluate("document.getElementById('onetrust-consent-sdk')?.remove()")
+            except Exception:
+                pass
+            page.on("request", _on_request)
+            await page.click(config.LOGIN_SUBMIT_SELECTOR, force=True)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=config.NAV_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                pass
+            await page.wait_for_timeout(config.LOGIN_WAIT_MS)
+
+            final_url = page.url
+            final_title = await page.title()
+            body_text = await page.evaluate("document.body ? document.body.innerText : ''")
+            username_visible = config.SMARTLEX24_USERNAME.lower() in (body_text or "").lower()
+            # cerchiamo anche solo la parte prima della @ (spesso è quella mostrata)
+            username_prefix = config.SMARTLEX24_USERNAME.split("@")[0].lower()
+            username_prefix_visible = username_prefix in (body_text or "").lower()
+            login_form_still_present = False
+            try:
+                login_form_still_present = await page.locator(config.LOGIN_USERNAME_SELECTOR).is_visible(timeout=1000)
+            except Exception:
+                pass
+
+            cookies = await context.cookies()
+        finally:
+            await browser.close()
+
+    return {
+        "url_finale": final_url,
+        "titolo_pagina_finale": final_title,
+        "email_utente_visibile_in_pagina": username_visible,
+        "prefisso_email_visibile_in_pagina": username_prefix_visible,
+        "form_login_ancora_presente": login_form_still_present,
+        "token_catturato": bool(captured_token),
+        "token_lunghezza": len(captured_token) if captured_token else 0,
+        "token_inizio": captured_token[:20] if captured_token else None,
+        "token_fine": captured_token[-20:] if captured_token else None,
+        "numero_token_visti": len(all_tokens_seen),
+        "numero_cookie": len(cookies),
+        "nomi_cookie": [c["name"] for c in cookies],
+    }
+
+
 async def _probe(query: str) -> None:
     import json
 
