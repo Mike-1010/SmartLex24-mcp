@@ -12,6 +12,17 @@ LOGIN_PAGE_URL = f"{BASE}/public/default.aspx?logout=true"
 SEARCH_URL = "https://dwa.ilsole24ore.com/dir/api/BD.Search.BDSearchServiceREST.svc/PullSearch3"
 TOKEN_INFO_URL = "https://dwa.ilsole24ore.com/dir/api/BD.User.BDUserServiceREST.svc/GetTokenInfo"
 
+# Header richiesti dal gateway API (JsonORB) di dwa.ilsole24ore.com, scoperti
+# via DevTools il 29/09/2026: senza "jsonorb-apikey" (chiave dell'applicazione
+# web, non un segreto personale dell'utente - è la stessa per chiunque usi il
+# sito, visibile in ogni richiesta del browser) il gateway non riconosce la
+# richiesta come proveniente dall'app e restituisce un fallback generico
+# invece dei risultati autenticati/personalizzati. "Origin"/"Referer" imitano
+# quelli che il browser invia sempre da smartlex24.ilsole24ore.com.
+JSONORB_API_KEY = os.getenv("SMARTLEX24_JSONORB_API_KEY", "918704ec-4811-45b6-a169-16bae3df69a8")
+API_ORIGIN = os.getenv("SMARTLEX24_API_ORIGIN", "https://smartlex24.ilsole24ore.com")
+API_REFERER = os.getenv("SMARTLEX24_API_REFERER", "https://smartlex24.ilsole24ore.com/")
+
 # Credenziali: MAI hardcoded. Impostale come variabili d'ambiente su Render.
 SMARTLEX24_USERNAME = os.getenv("SMARTLEX24_USERNAME", "")
 SMARTLEX24_PASSWORD = os.getenv("SMARTLEX24_PASSWORD", "")

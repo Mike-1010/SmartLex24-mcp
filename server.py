@@ -208,7 +208,14 @@ async def _search(query: str, n: int) -> dict:
         },
         "token": token,
     }
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "jsonorb-apikey": config.JSONORB_API_KEY,
+        "jsonorb-addcache": "true",
+        "Origin": config.API_ORIGIN,
+        "Referer": config.API_REFERER,
+    }
     if _session_cookies:
         headers["Cookie"] = _cookie_header(_session_cookies)
 
