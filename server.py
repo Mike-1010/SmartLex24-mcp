@@ -233,7 +233,13 @@ async def _search(query: str, n: int) -> dict:
         "Content-Type": "application/json",
         "Accept": "application/json, text/javascript, */*; q=0.01",
         "jsonorb-apikey": config.JSONORB_API_KEY,
-        "jsonorb-addcache": "true",
+        # NOTA (29/09/2026): disattivato "true" -> "false". Sospetto che il
+        # gateway API stesse servendo una risposta cache-ata generica sempre
+        # identica (stessi 5 "Codice penale", stesso rank, a prescindere da
+        # query/token), probabilmente perché la chiave di cache usata dal
+        # server non include qualcosa che nel nostro caso manca/è costante
+        # (es. un cookie di sessione specifico). Da riverificare.
+        "jsonorb-addcache": "false",
         "Origin": config.API_ORIGIN,
         "Referer": config.API_REFERER,
     }
