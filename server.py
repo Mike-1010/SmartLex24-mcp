@@ -84,7 +84,15 @@ async def _login_and_capture_token() -> tuple[str, list]:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
-        page.on("request", _on_request)
+        # NOTA (scoperto il 29/09/2026): la pagina di login fa già delle
+        # chiamate POST con un "token" nel payload PRIMA di autenticarsi (per
+        # mostrare un'anteprima anonima/ospite della pagina). Se ci mettiamo
+        # in ascolto da subito, rischiamo di catturare quel token anonimo
+        # invece di quello vero generato dopo il login riuscito - risultato:
+        # le ricerche "funzionano" (nessun errore) ma restituiscono un
+        # catalogo generico non personalizzato, invece dei risultati
+        # dell'abbonamento. Ci mettiamo in ascolto solo DOPO aver cliccato
+        # "Accedi", scartando ogni token visto prima di quel momento.
 
         try:
             await page.goto(
@@ -107,6 +115,12 @@ async def _login_and_capture_token() -> tuple[str, list]:
                 )
             except Exception:
                 pass
+
+            # Ci mettiamo in ascolto delle richieste solo ORA, subito prima di
+            # cliccare "Accedi": qualunque token visto da questo momento in
+            # poi è (o dovrebbe essere) generato dopo un login riuscito, non
+            # prima.
+            page.on("request", _on_request)
 
             # Rete di sicurezza: se per qualunque motivo un altro elemento
             # dovesse comunque intercettare il click, forziamo il click
