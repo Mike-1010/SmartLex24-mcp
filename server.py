@@ -175,14 +175,36 @@ async def _search(query: str, n: int) -> dict:
     except LoginError as e:
         return {"errore": str(e)}
 
+    # Struttura del payload verificata via DevTools il 29/09/2026 su una
+    # ricerca reale: il campo del testo cercato è "queryWord", non
+    # "queryText" (che il sito ignora silenziosamente, restituendo un elenco
+    # generico invece di un errore). Gli altri campi sono presenti in ogni
+    # richiesta reale del sito: li replichiamo com'erano, a parte "rows" e
+    # "start" che rendiamo parametrici per la paginazione.
     payload = {
         "parameters": {
-            "proustFilter": True,
+            "addQueryExtBuca": False,
+            "didYouMean": True,
+            "enableQD": True,
             "excludeNotSearchablePackets": True,
+            "extraFacet": "",
             "facet": "tipologia",
             "facetMinCount": 1,
-            "queryText": query,
+            "facetSortIndex": True,
+            "groups": True,
+            "invokePush": True,
+            "loadFacetsTag": False,
+            "modulo24Embedded": False,
+            "order": "R",
+            "orderLucene": "score desc",
+            "pacchettiRicercaEstremi": "",
+            "proustFilter": True,
+            "queryExt": "",
+            "queryLucene": "",
+            "queryWord": query,
             "rows": max(1, min(n, config.MAX_ROWS)),
+            "start": 0,
+            "use_pcpa": False,
         },
         "token": token,
     }
