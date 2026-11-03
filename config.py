@@ -73,3 +73,25 @@ SESSION_TTL = int(os.getenv("SMARTLEX24_SESSION_TTL", "1800"))  # secondi
 TIMEOUT = 30
 DEFAULT_ROWS = 10
 MAX_ROWS = 20
+
+# --- Documenti "Integrale in PDF" (aggiunto il 03/11/2026) ---
+# Per questi documenti GetDocument restituisce "TestoDoc" vuoto: il testo sta
+# in un PDF statico. Nei risultati di ricerca osservati il 03/11/2026 l'URL ha
+# sempre la forma {PDF_BASE_URL}/{ultima cifra dell'id}/{id}.PDF (4 casi su 4:
+# 44883625 -> /5/, 40164153 -> /3/, 39610093 -> /3/, 45966459 -> /9/). Se la
+# risposta contiene già un URL .pdf usiamo quello; la ricostruzione è solo un
+# ripiego, segnalato nella risposta come "url_pdf_dedotto".
+PDF_BASE_URL = os.getenv("SMARTLEX24_PDF_BASE_URL", "https://static.ilsole24ore.com/dda")
+# Host da cui il connettore accetta di scaricare PDF (difesa contro URL
+# arbitrari presenti nelle risposte del sito).
+PDF_HOST_CONSENTITI = ("ilsole24ore.com",)
+PDF_MAX_BYTES = int(os.getenv("SMARTLEX24_PDF_MAX_BYTES", str(15 * 1024 * 1024)))
+MAX_CARATTERI_PDF = int(os.getenv("SMARTLEX24_MAX_CARATTERI_PDF", "150000"))
+
+# --- Diagnostica (aggiunto il 03/11/2026) ---
+# Lo strumento diagnostica_login è utile solo per il debug e rivela dettagli
+# sulla sessione: è disattivato di default. Per abilitarlo temporaneamente
+# imposta SMARTLEX24_ABILITA_DIAGNOSTICA=1 su Render e riavvia.
+ABILITA_DIAGNOSTICA = os.getenv("SMARTLEX24_ABILITA_DIAGNOSTICA", "0").strip().lower() in (
+    "1", "true", "si", "sì", "yes",
+)

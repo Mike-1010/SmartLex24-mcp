@@ -10,15 +10,28 @@ un vero browser headless (Playwright) che fa login e lascia partire le
 chiamate della pagina, intercettando la prima che porta il token nel payload.
 Una volta ottenuto, lo riusiamo direttamente via httpx per le ricerche
 successive, senza riaprire il browser ogni volta (finché resta valido).
+
+Versione 03/11/2026 - correzioni dopo i test dal vivo:
+- schede "atto normativo" con campi tutti null: ora si cercano i documenti
+  annidati, e una scheda non riconosciuta riporta i nomi dei suoi campi;
+- titolo sempre null in ricerca: ricavato dalle schede HTML, più un campo
+  "intestazione" (autorità + data) sempre presente;
+- documenti "Integrale in PDF" restituiti vuoti: ora il testo viene estratto
+  dal PDF, oppure si segnala chiaramente che il formato è PDF;
+- diagnostica_login disattivata di default e senza frammenti del token;
+- rimosso il campo "visibile" (inaffidabile) e ripulito l'HTML dagli estratti;
+- validazione locale dell'id documento.
 """
 import argparse
 import asyncio
 import html
+import io
 import os
 import re
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -32,14 +45,13 @@ professionali, secondo quanto incluso nell'abbonamento collegato.
 
 Usa `cerca_smartlex24` per le ricerche testuali e `leggi_documento_smartlex24`
 per il testo integrale di un documento trovato (passandogli il suo
-"idDocumento").
+"idDocumento"). I risultati con "apribile": false non hanno un idDocumento e
+non si possono leggere.
 
-ATTENZIONE - connettore sperimentale, in fase di prima verifica: il campo
-"visibile" nei risultati di ricerca non è affidabile per sapere se un
-documento è incluso nell'abbonamento (usa invece "accesso_negato" restituito
-da leggi_documento_smartlex24). Il primo login di una sessione è lento (apre
-un vero browser per autenticarsi): le ricerche successive sono più rapide
-perché riusano la sessione già ottenuta.
+Connettore sperimentale: trattare i risultati come indicativi e verificarli
+sulla fonte quando serve certezza. Il primo login di una sessione è lento
+(apre un vero browser per autenticarsi): le ricerche successive sono più
+rapide perché riusano la sessione già ottenuta.
 """
 
 mcp = FastMCP(
@@ -55,10 +67,81 @@ _session_token: Optional[str] = None
 _session_cookies: Optional[list] = None
 _session_ready_at = 0.0
 
+_ID_DOCUMENTO_RE = re.compile(r"^\d{1,12}$")
+_CHIAVI_ID = ("idDocumento", "IdDocumento", "DocumentId", "documentId", "documentid")
+_CHIAVI_TITOLO = ("titolo", "Titolo", "title", "Title", "titoloDocumento", "TitoloDocumento")
+
 
 class LoginError(Exception):
     """Il login non è andato a buon fine, o non è stato possibile catturare
     il token di sessione dopo un login apparentemente riuscito."""
+
+
+# ---------------------------------------------------------------------------
+# Sessione (login via browser headless)
+# ---------------------------------------------------------------------------
+
+async def _esegui_login(page, on_request) -> None:
+    """Passi di login comuni a sessione normale e diagnostica."""
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    await page.goto(
+        config.LOGIN_PAGE_URL,
+        timeout=config.NAV_TIMEOUT_MS,
+        wait_until="domcontentloaded",
+    )
+    await page.fill(config.LOGIN_USERNAME_SELECTOR, config.SMARTLEX24_USERNAME)
+    await page.fill(config.LOGIN_PASSWORD_SELECTOR, config.SMARTLEX24_PASSWORD)
+
+    # Il widget cookie OneTrust (banner o Preference Center con overlay
+    # scuro) copre il bottone "Accedi": lo rimuoviamo dal DOM, qualunque
+    # variante compaia.
+    try:
+        await page.evaluate("document.getElementById('onetrust-consent-sdk')?.remove()")
+    except Exception:
+        pass
+
+    # In ascolto solo da ORA: la pagina di login invia già, prima di
+    # autenticarsi, chiamate con un token anonimo/ospite (scoperto il
+    # 29/09/2026) che non va catturato.
+    page.on("request", on_request)
+    await page.click(config.LOGIN_SUBMIT_SELECTOR, force=True)
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=config.NAV_TIMEOUT_MS)
+    except PlaywrightTimeoutError:
+        pass  # la SPA può tenere connessioni aperte: non è di per sé un errore
+
+    try:
+        error_el = page.locator(config.LOGIN_ERROR_SELECTOR)
+        if await error_el.is_visible(timeout=2000):
+            msg = (await error_el.inner_text()).strip()
+            if msg:
+                raise LoginError(f"Login rifiutato da SmartLex24: {msg}")
+    except PlaywrightTimeoutError:
+        pass
+
+    # Attesa SEMPRE: un'eventuale chiamata di refresh del token, successiva
+    # alla prima, deve fare in tempo a sovrascrivere il token catturato.
+    await page.wait_for_timeout(config.LOGIN_WAIT_MS)
+
+
+def _intercetta_token(destinazione: dict):
+    """Crea un listener che salva in destinazione["token"] l'ULTIMO token
+    visto nelle chiamate REST del sito (il sito lo rigenera dopo il login)."""
+
+    def _on_request(request):
+        if request.method != "POST" or "dwa.ilsole24ore.com/dir/api/" not in request.url:
+            return
+        try:
+            data = request.post_data_json
+        except Exception:
+            data = None
+        if isinstance(data, dict) and data.get("token"):
+            destinazione["token"] = data["token"]
+            destinazione["visti"] = destinazione.get("visti", 0) + 1
+
+    return _on_request
 
 
 async def _login_and_capture_token() -> tuple[str, list]:
@@ -70,109 +153,27 @@ async def _login_and_capture_token() -> tuple[str, list]:
             "SMARTLEX24_USERNAME e SMARTLEX24_PASSWORD sul server."
         )
 
-    captured_token: Optional[str] = None
-
-    def _on_request(request):
-        nonlocal captured_token
-        if request.method != "POST":
-            return
-        if "dwa.ilsole24ore.com/dir/api/" not in request.url:
-            return
-        try:
-            data = request.post_data_json
-        except Exception:
-            data = None
-        if isinstance(data, dict) and data.get("token"):
-            # NOTA (29/09/2026): non ci fermiamo al primo token visto - il
-            # sito sembra rigenerare/aggiornare il token con chiamate
-            # successive al login (es. RefreshToken); prendiamo sempre
-            # l'ULTIMO visto, presumendolo il più aggiornato/valido.
-            captured_token = data["token"]
-
+    catturato: dict = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
-        # NOTA (scoperto il 29/09/2026): la pagina di login fa già delle
-        # chiamate POST con un "token" nel payload PRIMA di autenticarsi (per
-        # mostrare un'anteprima anonima/ospite della pagina). Se ci mettiamo
-        # in ascolto da subito, rischiamo di catturare quel token anonimo
-        # invece di quello vero generato dopo il login riuscito - risultato:
-        # le ricerche "funzionano" (nessun errore) ma restituiscono un
-        # catalogo generico non personalizzato, invece dei risultati
-        # dell'abbonamento. Ci mettiamo in ascolto solo DOPO aver cliccato
-        # "Accedi", scartando ogni token visto prima di quel momento.
-
         try:
-            await page.goto(
-                config.LOGIN_PAGE_URL,
-                timeout=config.NAV_TIMEOUT_MS,
-                wait_until="domcontentloaded",
-            )
-            await page.fill(config.LOGIN_USERNAME_SELECTOR, config.SMARTLEX24_USERNAME)
-            await page.fill(config.LOGIN_PASSWORD_SELECTOR, config.SMARTLEX24_PASSWORD)
-
-            # Il widget cookie OneTrust (banner o, a volte, il Preference
-            # Center con un proprio overlay scuro "onetrust-pc-dark-filter")
-            # copre il bottone "Accedi" e ne blocca il click. Invece di
-            # inseguire quale dei due componenti OneTrust sta mostrando (i
-            # loro bottoni hanno id diversi), lo rimuoviamo proprio dal DOM:
-            # più robusto, non dipende da quale variante compare.
-            try:
-                await page.evaluate(
-                    "document.getElementById('onetrust-consent-sdk')?.remove()"
-                )
-            except Exception:
-                pass
-
-            # Ci mettiamo in ascolto delle richieste solo ORA, subito prima di
-            # cliccare "Accedi": qualunque token visto da questo momento in
-            # poi è (o dovrebbe essere) generato dopo un login riuscito, non
-            # prima.
-            page.on("request", _on_request)
-
-            # Rete di sicurezza: se per qualunque motivo un altro elemento
-            # dovesse comunque intercettare il click, forziamo il click
-            # bypassando il controllo "receives pointer events" di Playwright.
-            await page.click(config.LOGIN_SUBMIT_SELECTOR, force=True)
-
-            try:
-                await page.wait_for_load_state("networkidle", timeout=config.NAV_TIMEOUT_MS)
-            except PlaywrightTimeoutError:
-                pass  # la SPA può tenere connessioni aperte: non è di per sé un errore
-
-            # Controllo esplicito di un eventuale messaggio di login rifiutato
-            # (credenziali sbagliate), per dare un errore chiaro invece di un
-            # generico timeout nella cattura del token.
-            try:
-                error_el = page.locator(config.LOGIN_ERROR_SELECTOR)
-                if await error_el.is_visible(timeout=2000):
-                    msg = (await error_el.inner_text()).strip()
-                    if msg:
-                        raise LoginError(f"Login rifiutato da SmartLex24: {msg}")
-            except PlaywrightTimeoutError:
-                pass
-
-            # Attesa aggiuntiva SEMPRE (non solo se manca ancora un token):
-            # vogliamo dare tempo a un'eventuale chiamata di refresh/rinnovo
-            # del token, successiva al primo, di completarsi e sovrascrivere
-            # "captured_token" con il valore più aggiornato.
-            await page.wait_for_timeout(config.LOGIN_WAIT_MS)
+            await _esegui_login(page, _intercetta_token(catturato))
         except PlaywrightTimeoutError as e:
             raise LoginError(f"Timeout durante il login: {e}") from e
         finally:
             cookies = await context.cookies()
             await browser.close()
 
-    if not captured_token:
+    if not catturato.get("token"):
         raise LoginError(
             "Login apparentemente riuscito ma non è stato possibile catturare "
             "il token di sessione dalle chiamate della pagina (il sito potrebbe "
             "aver cambiato il proprio funzionamento interno: da riverificare "
             "con DevTools)."
         )
-
-    return captured_token, cookies
+    return catturato["token"], cookies
 
 
 async def ensure_session() -> str:
@@ -191,17 +192,60 @@ async def ensure_session() -> str:
         return _session_token
 
 
+def _invalida_sessione() -> None:
+    global _session_token
+    _session_token = None
+
+
 def _cookie_header(cookies: Optional[list]) -> str:
     return "; ".join(f"{c['name']}={c['value']}" for c in (cookies or []))
 
 
+def _api_headers() -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "jsonorb-apikey": config.JSONORB_API_KEY,
+        # "false": con "true" il gateway sembrava servire una risposta
+        # cache-ata generica, identica per ogni query (osservato il 29/09/2026).
+        "jsonorb-addcache": "false",
+        "Origin": config.API_ORIGIN,
+        "Referer": config.API_REFERER,
+    }
+    if _session_cookies:
+        headers["Cookie"] = _cookie_header(_session_cookies)
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Funzioni di parsing pure (testabili senza rete)
+# ---------------------------------------------------------------------------
+
+def _html_a_testo(testo_html: str) -> str:
+    """Conversione minima da HTML a testo leggibile (paragrafi preservati)."""
+    if not testo_html:
+        return ""
+    testo = re.sub(r"<br\s*/?>", "\n", testo_html, flags=re.IGNORECASE)
+    testo = re.sub(r"</(?:p|h[1-6]|div|li)\s*>", "\n\n", testo, flags=re.IGNORECASE)
+    testo = re.sub(r"<[^>]+>", "", testo)
+    testo = html.unescape(testo).replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\n{3,}", "\n\n", testo).strip()
+
+
+def _html_a_testo_inline(testo_html: str) -> str:
+    """Come sopra ma su una riga (titoli, estratti): spazi multipli collassati."""
+    if not testo_html:
+        return ""
+    testo = re.sub(r"<[^>]+>", " ", testo_html)
+    testo = html.unescape(testo)
+    return re.sub(r"\s+", " ", testo).strip()
+
+
 def _ultimo_titolo_da_html(testo_html: str) -> Optional[str]:
-    """Il titolo/massima non è in un campo a sé (osservato il 29/09/2026): è
-    dentro un frammento HTML ("text2"/"Text2") con più blocchi - un'etichetta
-    tipo "Massima redazionale"/"Integrale" seguita dal titolo vero e proprio
-    in un <p> o <h1>. Prendiamo l'ULTIMO blocco <p>/<h1> trovato (di norma il
-    titolo, non l'etichetta), o tutto il testo spogliato dai tag se non ne
-    troviamo nessuno."""
+    """Il titolo/massima di un documento letto con GetDocument sta in un
+    frammento HTML ("Text2") con più blocchi: un'etichetta ("Integrale",
+    "Massima redazionale") e poi il titolo vero in un <p>/<h1>. Prendiamo
+    l'ULTIMO blocco, o tutto il testo spogliato dai tag se non ce ne sono."""
     if not testo_html:
         return None
     blocchi = re.findall(
@@ -211,104 +255,269 @@ def _ultimo_titolo_da_html(testo_html: str) -> Optional[str]:
     return _html_a_testo_inline(frammento) or None
 
 
-def _normalizza_documento(d: dict) -> dict:
-    """Unifica in un'unica struttura i due formati osservati nelle risposte
-    reali del 29/09/2026 (uno con tipologia/data/rank valorizzati e abstract
-    troncato con "...", l'altro con quei campi a null/0 ma un testo più
-    esteso in "text2"/abstract, spesso l'inizio della motivazione) - così chi
-    consuma i risultati non deve gestire due schemi diversi.
+_NCARD_TITOLO_RE = re.compile(
+    r"<h3[^>]*class=\"[^\"]*ncard-title[^\"]*\"[^>]*>(.*?)</h3>", re.IGNORECASE | re.DOTALL
+)
+_NCARD_SOTTOTITOLO_RE = re.compile(
+    r"<p[^>]*class=\"[^\"]*ncard-subtitle[^\"]*\"[^>]*>(.*?)</p>", re.IGNORECASE | re.DOTALL
+)
 
-    NOTA: il campo "visibile" non è ancora interpretabile con certezza (non
-    segue data/famiglia/tipo, ma il formato del risultato) - non affidarti al
-    suo valore per decidere se il testo integrale è incluso nell'abbonamento.
-    Usa invece "accesso_negato" restituito da leggi_documento_smartlex24.
-    "idDocumento" a 0 o assente significa che il documento non può comunque
-    essere aperto con leggi_documento_smartlex24.
-    """
-    testo = d.get("abstract") or d.get("text2") or d.get("Abstract") or ""
-    troncato = len(testo) > 800
-    return {
-        "idDocumento": d.get("idDocumento") or None,
-        "titolo": (
-            d.get("titolo")
-            or d.get("title")
-            or d.get("Title")
-            or _ultimo_titolo_da_html(d.get("text2") or "")
-        ),
-        "tipologia": d.get("tipologia") or None,
-        "data": d.get("data") if d.get("data") not in (None, "0001-01-01") else None,
-        "famiglia": d.get("famigliaCode") or d.get("famiglia") or None,
-        "url": d.get("url") or None,
+
+def _leggi_scheda(testo_html: str) -> tuple[Optional[str], bool]:
+    """Le "schede" dei risultati (osservate il 03/11/2026) hanno questa forma:
+        <h3 class="ncard-title">Articolo 2043</h3>
+        <p class="ncard-subtitle">Risarcimento per fatto illecito</p>
+    oppure, per le sentenze disponibili solo in PDF:
+        <h3 class="ncard-title">Integrale in PDF</h3>
+        <p class="ncard-subtitle ...">Responsabilità civile - ... - CTU</p>
+    Restituisce (titolo, è_pdf)."""
+    if not testo_html or "ncard-" not in testo_html:
+        return None, False
+    m_tit = _NCARD_TITOLO_RE.search(testo_html)
+    m_sub = _NCARD_SOTTOTITOLO_RE.search(testo_html)
+    tit = _html_a_testo_inline(m_tit.group(1)) if m_tit else ""
+    sub = _html_a_testo_inline(m_sub.group(1)) if m_sub else ""
+    is_pdf = "pdf" in tit.lower()
+    if is_pdf or tit.lower().startswith(("integrale", "massima")):
+        # L'etichetta ("Integrale in PDF") non è un titolo: conta il sottotitolo.
+        return (sub or None), is_pdf
+    parti = [x for x in (tit, sub) if x]
+    return (" - ".join(parti) or None), is_pdf
+
+
+def _senza_prefisso_numerico(valore: Optional[str]) -> Optional[str]:
+    """'152/Giurisprudenza/Corte di Cassazione civile' -> parti senza il
+    codice numerico iniziale (interno al sito, inutile per chi legge)."""
+    if not valore:
+        return None
+    parti = [p.strip() for p in str(valore).split("/") if p.strip()]
+    if parti and parti[0].isdigit():
+        parti = parti[1:]
+    return "/".join(parti) or None
+
+
+def _data_iso(valore: Any) -> Optional[str]:
+    """'2026-05-24T00:00:00Z' -> '2026-05-24'; le date "vuote" del sito
+    ('0001-01-01...') diventano None."""
+    if not valore:
+        return None
+    s = str(valore)
+    if s.startswith("0001"):
+        return None
+    m = re.match(r"(\d{4}-\d{2}-\d{2})", s)
+    return m.group(1) if m else s
+
+
+def _intestazione(tipologia: Optional[str], data: Optional[str]) -> Optional[str]:
+    """Intestazione leggibile sempre presente (anche quando il sito non dà un
+    titolo): 'Corte di Cassazione civile, Sezione 3 - 24/05/2026'."""
+    parti = (tipologia or "").split("/")
+    # la prima parte è la famiglia (es. "Giurisprudenza"): la togliamo se ce
+    # ne sono altre più specifiche
+    autorita = ", ".join(p for p in parti[1:] if p) if len(parti) > 1 else (tipologia or "")
+    data_it = None
+    if data and re.match(r"\d{4}-\d{2}-\d{2}$", data):
+        a, m, g = data.split("-")
+        data_it = f"{g}/{m}/{a}"
+    out = " - ".join(x for x in (autorita, data_it) if x)
+    return out or None
+
+
+def _id_di(d: dict) -> Optional[Any]:
+    for k in _CHIAVI_ID:
+        v = d.get(k)
+        if v not in (None, "", 0, "0"):
+            return v
+    return None
+
+
+def _figli_con_id(obj: Any, profondita: int = 0) -> list:
+    """Cerca, dentro una scheda senza id, i documenti annidati che un id ce
+    l'hanno (es. le singole voci di una scheda "atto normativo")."""
+    if profondita > 3:
+        return []
+    trovati = []
+    valori = obj.values() if isinstance(obj, dict) else obj if isinstance(obj, list) else []
+    for v in valori:
+        candidati = v if isinstance(v, list) else [v]
+        for item in candidati:
+            if not isinstance(item, dict):
+                continue
+            if _id_di(item) is not None:
+                trovati.append(item)
+            else:
+                trovati.extend(_figli_con_id(item, profondita + 1))
+    return trovati
+
+
+def _appiattisci(docs: list) -> list:
+    """Le schede senza id (osservate il 03/11/2026 per atti normativi interi,
+    es. 'Regolamento UE 1215/2012') vengono sostituite dai documenti
+    annidati, se ce ne sono; altrimenti restano, marcate come non apribili."""
+    out = []
+    for d in docs:
+        if not isinstance(d, dict):
+            continue
+        if _id_di(d) is not None:
+            out.append(d)
+            continue
+        figli = _figli_con_id(d)
+        out.extend(figli if figli else [d])
+    return out
+
+
+def _normalizza_documento(d: dict) -> dict:
+    """Unifica i diversi formati di risultato in un'unica struttura."""
+    grezzo = d.get("abstract") or d.get("Abstract") or d.get("text2") or d.get("Text2") or ""
+    titolo_scheda, is_pdf = _leggi_scheda(grezzo)
+
+    titolo = next((d.get(k) for k in _CHIAVI_TITOLO if d.get(k)), None)
+    if titolo:
+        titolo = _html_a_testo_inline(str(titolo))
+    else:
+        titolo = titolo_scheda or (
+            _ultimo_titolo_da_html(d.get("text2") or d.get("Text2") or "")
+            if not is_pdf else None
+        )
+
+    tipologia = _senza_prefisso_numerico(d.get("tipologia"))
+    data = _data_iso(d.get("data"))
+    url = d.get("url") or None
+    if url and str(url).lower().endswith(".pdf"):
+        is_pdf = True
+
+    # L'estratto non deve ripetere la scheda HTML (già diventata titolo).
+    estratto = "" if titolo_scheda else _html_a_testo_inline(grezzo)
+    troncato = len(estratto) > 800
+    id_doc = _id_di(d)
+
+    risultato = {
+        "idDocumento": id_doc,
+        "apribile": id_doc is not None,
+        "titolo": titolo or None,
+        "intestazione": _intestazione(tipologia, data),
+        "tipologia": tipologia,
+        "data": data,
+        "famiglia": _senza_prefisso_numerico(d.get("famigliaCode") or d.get("famiglia")),
+        "formato": "pdf" if is_pdf else None,
+        "url": url,
         "argomento": d.get("argomento") or None,
         "rank": d.get("rank"),
-        "visibile": d.get("visibile"),
-        "estratto": testo[:800] + "…" if troncato else testo,
-        "estratto_troncato_qui": troncato,
+        "estratto": estratto[:800] + "…" if troncato else estratto,
     }
+    if id_doc is None:
+        # Scheda di un tipo non ancora mappato: riportiamo solo i NOMI dei
+        # campi (mai i valori), per poterla mappare al prossimo aggiornamento.
+        risultato["campi_grezzi"] = sorted(str(k) for k in d.keys())
+    return risultato
 
 
-def _html_a_testo(testo_html: str) -> str:
-    """Conversione minima da HTML a testo leggibile per il campo "TestoDoc"
-    (niente dipendenze esterne: solo tag più comuni + unescape entità)."""
-    if not testo_html:
-        return ""
-    testo = re.sub(r"<br\s*/?>", "\n", testo_html, flags=re.IGNORECASE)
-    testo = re.sub(r"</p\s*>", "\n\n", testo, flags=re.IGNORECASE)
-    testo = re.sub(r"<[^>]+>", "", testo)
-    testo = html.unescape(testo)
-    return re.sub(r"\n{3,}", "\n\n", testo).strip()
+def _trova_url_pdf(obj: Any, profondita: int = 0) -> Optional[str]:
+    """Cerca un URL .pdf in qualunque campo testuale della risposta."""
+    if profondita > 4:
+        return None
+    if isinstance(obj, str):
+        m = re.search(r"https?://[^\s\"'<>]+?\.pdf\b", obj, flags=re.IGNORECASE)
+        return m.group(0) if m else None
+    valori = obj.values() if isinstance(obj, dict) else obj if isinstance(obj, list) else []
+    for v in valori:
+        trovato = _trova_url_pdf(v, profondita + 1)
+        if trovato:
+            return trovato
+    return None
 
 
-def _html_a_testo_inline(testo_html: str) -> str:
-    """Come sopra ma per campi di una riga (es. titoli): spazi al posto di
-    newline, spazi multipli collassati."""
-    if not testo_html:
-        return ""
-    testo = re.sub(r"<[^>]+>", " ", testo_html)
-    testo = html.unescape(testo)
-    return re.sub(r"\s{2,}", " ", testo).strip()
+def _url_pdf_dedotto(id_documento: str) -> str:
+    return f"{config.PDF_BASE_URL}/{id_documento[-1]}/{id_documento}.PDF"
+
+
+def _host_consentito(url: str) -> bool:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and any(
+        host == h or host.endswith("." + h) for h in config.PDF_HOST_CONSENTITI
+    )
+
+
+def _estrai_testo_pdf(contenuto: bytes) -> str:
+    from pypdf import PdfReader
+
+    reader = PdfReader(io.BytesIO(contenuto))
+    pagine = [(pagina.extract_text() or "").strip() for pagina in reader.pages]
+    testo = "\n\n".join(p for p in pagine if p)
+    return re.sub(r"[ \t]+\n", "\n", testo).strip()
+
+
+# ---------------------------------------------------------------------------
+# Chiamate al sito
+# ---------------------------------------------------------------------------
+
+async def _scarica_testo_pdf(url: str) -> dict:
+    """Scarica un PDF (solo da host del Sole 24 Ore) e ne estrae il testo."""
+    if not _host_consentito(url):
+        return {"errore_pdf": "URL del PDF su un host non consentito."}
+    headers = {"Referer": config.API_REFERER}
+    if _session_cookies:
+        headers["Cookie"] = _cookie_header(_session_cookies)
+    try:
+        async with httpx.AsyncClient(timeout=config.TIMEOUT, follow_redirects=True) as client:
+            async with client.stream("GET", url, headers=headers) as r:
+                if r.status_code != 200:
+                    return {"errore_pdf": f"Il PDF ha risposto con errore {r.status_code}."}
+                if not _host_consentito(str(r.url)):
+                    return {"errore_pdf": "Il PDF reindirizza a un host non consentito."}
+                dati = bytearray()
+                async for blocco in r.aiter_bytes():
+                    dati.extend(blocco)
+                    if len(dati) > config.PDF_MAX_BYTES:
+                        return {"errore_pdf": "PDF troppo grande per essere letto qui."}
+    except httpx.HTTPError as e:
+        return {"errore_pdf": f"Impossibile scaricare il PDF: {e}"}
+
+    if not bytes(dati[:5]).startswith(b"%PDF"):
+        return {"errore_pdf": "Il file scaricato non è un PDF (forse una pagina di login)."}
+    try:
+        testo = await asyncio.to_thread(_estrai_testo_pdf, bytes(dati))
+    except Exception as e:  # PDF danneggiato o non supportato
+        return {"errore_pdf": f"Impossibile estrarre il testo dal PDF: {e}"}
+    if not testo:
+        return {"errore_pdf": "Il PDF non contiene testo estraibile (probabilmente è una scansione)."}
+    troncato = len(testo) > config.MAX_CARATTERI_PDF
+    return {"testo": testo[: config.MAX_CARATTERI_PDF], "troncato": troncato}
 
 
 async def _get_document(id_documento: str) -> dict:
+    id_documento = str(id_documento).strip()
+    if not _ID_DOCUMENTO_RE.match(id_documento):
+        return {"errore": "idDocumento non valido: deve essere un numero (es. 45464265), "
+                          "preso da un risultato di cerca_smartlex24."}
+
     try:
         token = await ensure_session()
     except LoginError as e:
         return {"errore": str(e)}
 
-    # Struttura verificata via DevTools il 29/09/2026 cliccando "Integrale"
-    # su un risultato reale: endpoint e payload diversi da PullSearch3 (qui
-    # il campo è "documentId", non "queryWord").
+    # Struttura verificata via DevTools il 29/09/2026 cliccando "Integrale".
     payload = {
-        "documentId": str(id_documento),
-        "parameters": {
-            "references": False,
-            "checkUserPackages": True,
-            "staticToken": "",
-        },
+        "documentId": id_documento,
+        "parameters": {"references": False, "checkUserPackages": True, "staticToken": ""},
         "token": token,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "jsonorb-apikey": config.JSONORB_API_KEY,
-        "jsonorb-addcache": "false",
-        "Origin": config.API_ORIGIN,
-        "Referer": config.API_REFERER,
-    }
-    if _session_cookies:
-        headers["Cookie"] = _cookie_header(_session_cookies)
-
     async with httpx.AsyncClient(timeout=config.TIMEOUT) as client:
         try:
-            r = await client.post(config.DOCUMENT_URL, json=payload, headers=headers)
+            r = await client.post(config.DOCUMENT_URL, json=payload, headers=_api_headers())
         except httpx.HTTPError as e:
             return {"errore": f"Impossibile raggiungere SmartLex24: {e}"}
 
     if r.status_code in (401, 403):
-        global _session_token
-        _session_token = None
+        _invalida_sessione()
         return {"errore": "Sessione scaduta, riprova: al prossimo tentativo verrà rifatto il login."}
-
+    if r.status_code == 400:
+        return {"errore": "SmartLex24 ha rifiutato la richiesta (errore 400): probabilmente "
+                          "l'idDocumento non esiste."}
     if r.status_code != 200:
         return {"errore": f"SmartLex24 ha risposto con errore {r.status_code}."}
 
@@ -321,34 +530,63 @@ async def _get_document(id_documento: str) -> dict:
     if not result:
         return {"errore": "Documento non trovato o risposta vuota."}
 
-    return {
+    bloccato = bool(result.get("Blocked"))
+    testo = _html_a_testo(result.get("TestoDoc") or "")
+    risposta = {
         "idDocumento": result.get("DocumentId"),
         "titolo": _ultimo_titolo_da_html(result.get("Text2") or ""),
         "famiglia": result.get("Famiglia"),
         "sottofamiglia": result.get("SottoFamiglia"),
-        # NOTA (29/09/2026): "Blocked" qui sembra essere il vero indicatore
-        # di accesso negato dall'abbonamento (a differenza di "visibile" nei
-        # risultati di ricerca, il cui significato resta incerto) - da
-        # confermare su un documento realmente fuori abbonamento.
-        "accesso_negato": bool(result.get("Blocked")),
-        "testo_integrale": _html_a_testo(result.get("TestoDoc") or ""),
+        # "Blocked" pare il vero indicatore di accesso negato (da confermare
+        # su un documento realmente fuori abbonamento).
+        "accesso_negato": bloccato,
+        "formato": "html" if testo else None,
+        "testo_integrale": testo,
         "id_precedente": result.get("DocumentIdPrev") or None,
         "id_successivo": result.get("DocumentIdNext") or None,
     }
 
+    if testo or bloccato:
+        return risposta
+
+    # Testo vuoto e documento non bloccato: quasi sempre un "Integrale in PDF".
+    url_pdf = _trova_url_pdf(result)
+    dedotto = url_pdf is None
+    if dedotto:
+        url_pdf = _url_pdf_dedotto(id_documento)
+    pdf = await _scarica_testo_pdf(url_pdf)
+
+    risposta["formato"] = "pdf"
+    risposta["url_pdf"] = url_pdf
+    risposta["url_pdf_dedotto"] = dedotto
+    if "testo" in pdf:
+        risposta["testo_integrale"] = pdf["testo"]
+        risposta["testo_troncato"] = pdf["troncato"]
+        risposta["nota"] = "Testo estratto automaticamente dal PDF: impaginazione e " \
+                           "a capo possono essere imperfetti."
+    else:
+        risposta["nota"] = (
+            "Il testo integrale è disponibile solo in PDF e non è stato possibile "
+            f"estrarlo ({pdf['errore_pdf']}). Il testo vuoto NON significa documento "
+            "senza contenuto: apri url_pdf, oppure prova id_precedente/id_successivo, "
+            "che a volte sono la versione HTML della stessa decisione."
+        )
+    return risposta
+
 
 async def _search(query: str, n: int) -> dict:
+    query = (query or "").strip()
+    if not query:
+        return {"errore": "La query è vuota."}
+
     try:
         token = await ensure_session()
     except LoginError as e:
         return {"errore": str(e)}
 
-    # Struttura del payload verificata via DevTools il 29/09/2026 su una
-    # ricerca reale: il campo del testo cercato è "queryWord", non
-    # "queryText" (che il sito ignora silenziosamente, restituendo un elenco
-    # generico invece di un errore). Gli altri campi sono presenti in ogni
-    # richiesta reale del sito: li replichiamo com'erano, a parte "rows" e
-    # "start" che rendiamo parametrici per la paginazione.
+    n_effettivo = max(1, min(int(n), config.MAX_ROWS))
+    # Payload verificato via DevTools il 29/09/2026: il testo va in
+    # "queryWord" (non "queryText", ignorato in silenzio dal sito).
     payload = {
         "parameters": {
             "addQueryExtBuca": False,
@@ -370,42 +608,21 @@ async def _search(query: str, n: int) -> dict:
             "queryExt": "",
             "queryLucene": "",
             "queryWord": query,
-            "rows": max(1, min(n, config.MAX_ROWS)),
+            "rows": n_effettivo,
             "start": 0,
             "use_pcpa": False,
         },
         "token": token,
     }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "jsonorb-apikey": config.JSONORB_API_KEY,
-        # NOTA (29/09/2026): disattivato "true" -> "false". Sospetto che il
-        # gateway API stesse servendo una risposta cache-ata generica sempre
-        # identica (stessi 5 "Codice penale", stesso rank, a prescindere da
-        # query/token), probabilmente perché la chiave di cache usata dal
-        # server non include qualcosa che nel nostro caso manca/è costante
-        # (es. un cookie di sessione specifico). Da riverificare.
-        "jsonorb-addcache": "false",
-        "Origin": config.API_ORIGIN,
-        "Referer": config.API_REFERER,
-    }
-    if _session_cookies:
-        headers["Cookie"] = _cookie_header(_session_cookies)
-
     async with httpx.AsyncClient(timeout=config.TIMEOUT) as client:
         try:
-            r = await client.post(config.SEARCH_URL, json=payload, headers=headers)
+            r = await client.post(config.SEARCH_URL, json=payload, headers=_api_headers())
         except httpx.HTTPError as e:
             return {"errore": f"Impossibile raggiungere SmartLex24: {e}"}
 
-    if r.status_code == 401 or r.status_code == 403:
-        # Sessione scaduta lato server nonostante la cache locale: forziamo
-        # un nuovo login al prossimo tentativo.
-        global _session_token
-        _session_token = None
+    if r.status_code in (401, 403):
+        _invalida_sessione()
         return {"errore": "Sessione scaduta, riprova: al prossimo tentativo verrà rifatto il login."}
-
     if r.status_code != 200:
         return {"errore": f"SmartLex24 ha risposto con errore {r.status_code}."}
 
@@ -415,26 +632,24 @@ async def _search(query: str, n: int) -> dict:
         return {"errore": "Risposta inattesa da SmartLex24 (non JSON)."}
 
     result = parsed.get("Result", {}) or {}
-    docs = result.get("Documents", []) or []
-
-    # Il campo "rows" del payload non è sempre rispettato dal sito (osservato
-    # il 29/09/2026: righe annidate possono far superare il numero
-    # richiesto), quindi tagliamo qui in modo esplicito a "n effettivo", per
-    # rispettare quanto chiesto e limitare la dimensione della risposta.
-    n_effettivo = max(1, min(n, config.MAX_ROWS))
-    docs = docs[:n_effettivo]
+    docs = _appiattisci(result.get("Documents", []) or [])
+    # "rows" non è sempre rispettato dal sito: tagliamo qui.
+    risultati = [_normalizza_documento(d) for d in docs[:n_effettivo]]
 
     return {
-        "totale_trovati": result.get("DocsFound", len(docs)),
+        "totale_trovati": result.get("DocsFound", len(risultati)),
         "did_you_mean": result.get("DidYouMean") or None,
-        "risultati": [_normalizza_documento(d) for d in docs],
-        "nota": "Struttura dei risultati normalizzata da questo connettore. "
-        "Per leggere il testo integrale di un documento usa "
-        "leggi_documento_smartlex24 con il suo 'idDocumento' - il campo "
-        "'visibile' qui non è affidabile per sapere se è incluso "
-        "nell'abbonamento, usa 'accesso_negato' da quello strumento.",
+        "risultati": risultati,
+        "nota": "Per il testo integrale usa leggi_documento_smartlex24 con l'idDocumento. "
+                "'intestazione' è ricavata da tipologia e data del sito; 'formato': 'pdf' "
+                "indica un documento disponibile solo in PDF. I risultati con "
+                "'apribile': false non si possono leggere.",
     }
 
+
+# ---------------------------------------------------------------------------
+# Strumenti MCP
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
 async def cerca_smartlex24(query: str, n: int = 10) -> dict:
@@ -442,20 +657,19 @@ async def cerca_smartlex24(query: str, n: int = 10) -> dict:
     approfondimenti professionali, secondo l'abbonamento configurato sul
     server.
 
-    Ogni risultato è normalizzato con gli stessi campi (idDocumento, titolo,
-    tipologia, data, famiglia, url, argomento, rank, visibile, estratto):
-    alcuni possono essere null a seconda del tipo di documento. "n" viene
-    sempre rispettato lato connettore (anche quando il sito restituisce più
-    righe del richiesto). "estratto" è solo un'anteprima: per il testo
-    integrale usa leggi_documento_smartlex24 con l'"idDocumento" del
-    risultato che interessa.
+    Ogni risultato ha gli stessi campi: idDocumento, apribile, titolo,
+    intestazione (autorità e data, sempre presente quando il sito le
+    fornisce), tipologia, data (AAAA-MM-GG), famiglia, formato ("pdf" per i
+    documenti disponibili solo in PDF), url, argomento, rank, estratto.
+    Il titolo può mancare per le sentenze: in quel caso usa intestazione ed
+    estratto. "estratto" è solo un'anteprima: per il testo integrale usa
+    leggi_documento_smartlex24 con l'"idDocumento".
 
-    ATTENZIONE: connettore sperimentale, non ancora interamente verificato
-    (in particolare il significato del campo "visibile", da non usare per
-    sapere se il testo integrale è incluso nell'abbonamento - per quello usa
-    "accesso_negato" restituito da leggi_documento_smartlex24). Trattare i
-    risultati come indicativi e verificarli sulla fonte quando serve
-    certezza.
+    La ricerca non ha filtri: parole come "Cassazione" nella query non
+    restringono i risultati alla sola Cassazione.
+
+    Connettore sperimentale: trattare i risultati come indicativi e
+    verificarli sulla fonte quando serve certezza.
 
     Args:
         query: testo da cercare.
@@ -469,77 +683,48 @@ async def leggi_documento_smartlex24(id_documento: str) -> dict:
     """Legge il testo integrale di un documento SmartLex24, dato il suo
     "idDocumento" (restituito da un risultato di cerca_smartlex24).
 
-    Se "accesso_negato" è true, il documento non è incluso nell'abbonamento
-    collegato (o non è stato possibile leggerlo) e "testo_integrale" sarà
-    vuoto: non trattare in quel caso una stringa vuota come "documento senza
-    contenuto".
+    - "accesso_negato": true -> documento non incluso nell'abbonamento,
+      "testo_integrale" vuoto.
+    - "formato": "pdf" -> il testo è stato estratto dal PDF (vedi
+      "url_pdf"); se l'estrazione non è riuscita, "nota" lo spiega e
+      "testo_integrale" è vuoto: NON significa documento senza contenuto.
 
     Args:
-        id_documento: l'idDocumento di un risultato di cerca_smartlex24.
+        id_documento: l'idDocumento numerico di un risultato di cerca_smartlex24.
     """
     return await _get_document(id_documento)
 
 
-@mcp.tool()
 async def diagnostica_login() -> dict:
-    """Diagnostica: esegue il login e restituisce informazioni tecniche per
-    capire se è andato davvero a buon fine (URL finale della pagina, se
-    l'email dell'utente compare da qualche parte nella pagina, lunghezza e
-    inizio/fine del token catturato) - non fa nessuna ricerca. Da usare solo
-    per debug del connettore, non è pensato per l'utente finale."""
+    """Diagnostica (solo debug del connettore, non per l'utente finale):
+    esegue il login e dice se è andato a buon fine - URL e titolo della
+    pagina finale, se il form di login è ancora presente, se un token è
+    stato catturato e quanti ne sono passati. Non mostra il token né i
+    cookie. Disponibile solo con SMARTLEX24_ABILITA_DIAGNOSTICA=1."""
     from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
     if not config.SMARTLEX24_USERNAME or not config.SMARTLEX24_PASSWORD:
         return {"errore": "Credenziali non configurate."}
 
-    captured_token: Optional[str] = None
-    all_tokens_seen = []
-
-    def _on_request(request):
-        nonlocal captured_token
-        if request.method != "POST" or "dwa.ilsole24ore.com/dir/api/" not in request.url:
-            return
-        try:
-            data = request.post_data_json
-        except Exception:
-            data = None
-        if isinstance(data, dict) and data.get("token"):
-            captured_token = data["token"]
-            all_tokens_seen.append({"url": request.url, "token_len": len(data["token"])})
-
+    catturato: dict = {}
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
         page = await context.new_page()
         try:
-            await page.goto(config.LOGIN_PAGE_URL, timeout=config.NAV_TIMEOUT_MS, wait_until="domcontentloaded")
-            await page.fill(config.LOGIN_USERNAME_SELECTOR, config.SMARTLEX24_USERNAME)
-            await page.fill(config.LOGIN_PASSWORD_SELECTOR, config.SMARTLEX24_PASSWORD)
             try:
-                await page.evaluate("document.getElementById('onetrust-consent-sdk')?.remove()")
-            except Exception:
-                pass
-            page.on("request", _on_request)
-            await page.click(config.LOGIN_SUBMIT_SELECTOR, force=True)
-            try:
-                await page.wait_for_load_state("networkidle", timeout=config.NAV_TIMEOUT_MS)
-            except PlaywrightTimeoutError:
-                pass
-            await page.wait_for_timeout(config.LOGIN_WAIT_MS)
-
+                await _esegui_login(page, _intercetta_token(catturato))
+            except LoginError as e:
+                return {"errore": str(e)}
+            except PlaywrightTimeoutError as e:
+                return {"errore": f"Timeout durante il login: {e}"}
             final_url = page.url
             final_title = await page.title()
-            body_text = await page.evaluate("document.body ? document.body.innerText : ''")
-            username_visible = config.SMARTLEX24_USERNAME.lower() in (body_text or "").lower()
-            # cerchiamo anche solo la parte prima della @ (spesso è quella mostrata)
-            username_prefix = config.SMARTLEX24_USERNAME.split("@")[0].lower()
-            username_prefix_visible = username_prefix in (body_text or "").lower()
-            login_form_still_present = False
+            form_presente = False
             try:
-                login_form_still_present = await page.locator(config.LOGIN_USERNAME_SELECTOR).is_visible(timeout=1000)
+                form_presente = await page.locator(config.LOGIN_USERNAME_SELECTOR).is_visible(timeout=1000)
             except Exception:
                 pass
-
             cookies = await context.cookies()
         finally:
             await browser.close()
@@ -547,17 +732,16 @@ async def diagnostica_login() -> dict:
     return {
         "url_finale": final_url,
         "titolo_pagina_finale": final_title,
-        "email_utente_visibile_in_pagina": username_visible,
-        "prefisso_email_visibile_in_pagina": username_prefix_visible,
-        "form_login_ancora_presente": login_form_still_present,
-        "token_catturato": bool(captured_token),
-        "token_lunghezza": len(captured_token) if captured_token else 0,
-        "token_inizio": captured_token[:20] if captured_token else None,
-        "token_fine": captured_token[-20:] if captured_token else None,
-        "numero_token_visti": len(all_tokens_seen),
+        "form_login_ancora_presente": form_presente,
+        "token_catturato": bool(catturato.get("token")),
+        "token_lunghezza": len(catturato.get("token") or ""),
+        "numero_token_visti": catturato.get("visti", 0),
         "numero_cookie": len(cookies),
-        "nomi_cookie": [c["name"] for c in cookies],
     }
+
+
+if config.ABILITA_DIAGNOSTICA:
+    mcp.tool()(diagnostica_login)
 
 
 async def _probe(query: str) -> None:
@@ -576,4 +760,11 @@ if __name__ == "__main__":
         asyncio.run(_probe(args.probe))
         sys.exit(0)
 
-    mcp.run(transport=os.getenv("MCP_TRANSPORT", "streamable-http"))
+    transport = os.getenv("MCP_TRANSPORT", "streamable-http")
+    if transport != "stdio" and os.getenv("MCP_PATH", "/mcp") == "/mcp":
+        print(
+            "ATTENZIONE: MCP_PATH non è impostato a un percorso segreto: chiunque "
+            "conosca l'indirizzo del server può usare il tuo abbonamento.",
+            file=sys.stderr,
+        )
+    mcp.run(transport=transport)
