@@ -26,7 +26,7 @@ Correzioni dopo i test dal vivo:
 1. Le schede "atto normativo" (es. ricerca "Regolamento UE 1215/2012")
    arrivavano con tutti i campi `null`. Ora vengono sostituite dai documenti
    annidati, se ci sono; altrimenti restano con `apribile: false` e
-   `campi_grezzi` (solo i nomi dei campi) per poterle mappare.
+   un riepilogo dei campi per poterle mappare.
 2. `titolo` era sempre `null` in ricerca: ora è ricavato dalle schede del
    sito quando c'è, e in ogni caso c'è il nuovo campo `intestazione`.
 3. I documenti "Integrale in PDF" tornavano con testo vuoto: ora il testo è
@@ -35,6 +35,19 @@ Correzioni dopo i test dal vivo:
    token né i nomi dei cookie.
 5. Rimosso il campo `visibile` (inaffidabile); tolto l'HTML dagli estratti.
 6. L'`id_documento` è validato prima di contattare il sito.
+
+### Secondo aggiornamento (03/11/2026, dopo i test dal vivo)
+
+- Documenti solo in PDF: prima si cerca la versione HTML della stessa
+  decisione (documento adiacente con lo stesso titolo), più pulita e con i
+  nomi delle parti oscurati; il PDF resta indicato in `url_pdf`.
+- Testo estratto dai PDF: tolte le righe ripetute in calce a ogni pagina
+  (firma digitale, numeri di registro) e i numeri di pagina.
+- Titolo delle norme: non più solo "Testo in vigore dal ...", ma libro,
+  titolo, articolo e rubrica.
+- Schede degli atti normativi interi: al posto di `campi_grezzi` c'è
+  `anteprima_campi`, con i valori brevi dei campi candidati, per poterle
+  rendere apribili nel prossimo aggiornamento.
 
 ## Come funziona
 

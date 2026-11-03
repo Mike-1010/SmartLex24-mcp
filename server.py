@@ -251,8 +251,15 @@ def _ultimo_titolo_da_html(testo_html: str) -> Optional[str]:
     blocchi = re.findall(
         r"<(?:h1|p)[^>]*>(.*?)</(?:h1|p)>", testo_html, flags=re.IGNORECASE | re.DOTALL
     )
-    frammento = blocchi[-1] if blocchi else testo_html
-    return _html_a_testo_inline(frammento) or None
+    if not blocchi:
+        return _html_a_testo_inline(testo_html) or None
+    ultimo = _html_a_testo_inline(blocchi[-1])
+    # Per le norme l'ultimo blocco è la nota di vigenza ("Testo in vigore dal
+    # 21 aprile 1942", osservato il 03/11/2026), non il titolo: in quel caso
+    # teniamo l'intero frammento (libro, titolo, articolo, rubrica, vigenza).
+    if re.match(r"^(testo\s+)?(in\s+vigore|vigente|abrogat)", ultimo, flags=re.IGNORECASE):
+        return _html_a_testo_inline(testo_html) or None
+    return ultimo or None
 
 
 _NCARD_TITOLO_RE = re.compile(
@@ -406,10 +413,44 @@ def _normalizza_documento(d: dict) -> dict:
         "estratto": estratto[:800] + "…" if troncato else estratto,
     }
     if id_doc is None:
-        # Scheda di un tipo non ancora mappato: riportiamo solo i NOMI dei
-        # campi (mai i valori), per poterla mappare al prossimo aggiornamento.
-        risultato["campi_grezzi"] = sorted(str(k) for k in d.keys())
+        # Scheda non ancora mappata (atti normativi interi, 03/11/2026). Per
+        # mapparla serve vedere i valori dei campi candidati: ne mostriamo
+        # un'anteprima breve (metadati di catalogo, nessun dato personale).
+        risultato["anteprima_campi"] = _anteprima_scheda(d)
     return risultato
+
+
+_CAMPI_ANTEPRIMA = (
+    "idProvvedimento", "numeroDocumento", "idDocType", "idFonte",
+    "numFonte2", "exArticolo", "text1", "text2", "abstract2", "tipologia",
+    "data", "url", "sezione", "sottoFamiglia", "origin", "extension",
+)
+
+
+def _anteprima_scheda(d: dict) -> dict:
+    anteprima = {}
+    for k in _CAMPI_ANTEPRIMA:
+        v = d.get(k)
+        if v in (None, "", [], {}):
+            continue
+        testo = _html_a_testo_inline(str(v)) if isinstance(v, str) else v
+        if isinstance(testo, str) and len(testo) > 150:
+            testo = testo[:150] + "…"
+        anteprima[k] = testo
+    correlati = d.get("RelatedDocuments")
+    if isinstance(correlati, list):
+        anteprima["RelatedDocuments_numero"] = len(correlati)
+        if correlati and isinstance(correlati[0], dict):
+            primo = correlati[0]
+            anteprima["RelatedDocuments_campi"] = sorted(str(k) for k in primo.keys())
+            anteprima["RelatedDocuments_primo"] = {
+                k: (str(v)[:100] if isinstance(v, str) else v)
+                for k, v in primo.items()
+                if isinstance(v, (str, int, float, bool)) and v not in ("", None)
+            }
+    elif correlati not in (None, "", {}):
+        anteprima["RelatedDocuments_tipo"] = type(correlati).__name__
+    return anteprima
 
 
 def _trova_url_pdf(obj: Any, profondita: int = 0) -> Optional[str]:
@@ -447,8 +488,41 @@ def _estrai_testo_pdf(contenuto: bytes) -> str:
 
     reader = PdfReader(io.BytesIO(contenuto))
     pagine = [(pagina.extract_text() or "").strip() for pagina in reader.pages]
+    pagine = _togli_intestazioni_ripetute(pagine)
     testo = "\n\n".join(p for p in pagine if p)
-    return re.sub(r"[ \t]+\n", "\n", testo).strip()
+    testo = re.sub(r"[ \t]+\n", "\n", testo)
+    return re.sub(r"\n{3,}", "\n\n", testo).strip()
+
+
+def _togli_intestazioni_ripetute(pagine: list) -> list:
+    """Toglie le righe che si ripetono uguali su molte pagine (firma digitale,
+    numeri di registro e data di pubblicazione in calce a ogni pagina delle
+    sentenze della Cassazione, osservati il 03/11/2026) e i numeri di pagina
+    isolati. La prima occorrenza di ogni riga ripetuta viene conservata, così
+    i dati (es. "Data pubblicazione 02/03/2026") restano nel testo una volta."""
+    if len(pagine) < 3:
+        return pagine
+    conteggio: dict = {}
+    for p in pagine:
+        for riga in {r.strip() for r in p.splitlines() if r.strip()}:
+            conteggio[riga] = conteggio.get(riga, 0) + 1
+    soglia = max(3, len(pagine) // 2)
+    ripetute = {r for r, n in conteggio.items() if n >= soglia}
+    gia_viste: set = set()
+    risultato = []
+    for p in pagine:
+        righe = []
+        for riga in p.splitlines():
+            r = riga.strip()
+            if re.fullmatch(r"\d{1,3}", r):
+                continue
+            if r in ripetute:
+                if r in gia_viste:
+                    continue
+                gia_viste.add(r)
+            righe.append(riga)
+        risultato.append("\n".join(righe).strip())
+    return risultato
 
 
 # ---------------------------------------------------------------------------
@@ -489,18 +563,9 @@ async def _scarica_testo_pdf(url: str) -> dict:
     return {"testo": testo[: config.MAX_CARATTERI_PDF], "troncato": troncato}
 
 
-async def _get_document(id_documento: str) -> dict:
-    id_documento = str(id_documento).strip()
-    if not _ID_DOCUMENTO_RE.match(id_documento):
-        return {"errore": "idDocumento non valido: deve essere un numero (es. 45464265), "
-                          "preso da un risultato di cerca_smartlex24."}
-
-    try:
-        token = await ensure_session()
-    except LoginError as e:
-        return {"errore": str(e)}
-
-    # Struttura verificata via DevTools il 29/09/2026 cliccando "Integrale".
+async def _chiama_get_document(id_documento: str, token: str) -> dict:
+    """Chiamata grezza a GetDocument: restituisce {"result": ...} oppure
+    {"errore": ...}. Struttura verificata via DevTools il 29/09/2026."""
     payload = {
         "documentId": id_documento,
         "parameters": {"references": False, "checkUserPackages": True, "staticToken": ""},
@@ -520,33 +585,78 @@ async def _get_document(id_documento: str) -> dict:
                           "l'idDocumento non esiste."}
     if r.status_code != 200:
         return {"errore": f"SmartLex24 ha risposto con errore {r.status_code}."}
-
     try:
         parsed = r.json()
     except ValueError:
         return {"errore": "Risposta inattesa da SmartLex24 (non JSON)."}
-
     result = parsed.get("Result") or {}
     if not result:
         return {"errore": "Documento non trovato o risposta vuota."}
+    return {"result": result}
 
-    bloccato = bool(result.get("Blocked"))
+
+def _risposta_da_result(result: dict) -> dict:
     testo = _html_a_testo(result.get("TestoDoc") or "")
-    risposta = {
+    return {
         "idDocumento": result.get("DocumentId"),
         "titolo": _ultimo_titolo_da_html(result.get("Text2") or ""),
         "famiglia": result.get("Famiglia"),
         "sottofamiglia": result.get("SottoFamiglia"),
         # "Blocked" pare il vero indicatore di accesso negato (da confermare
         # su un documento realmente fuori abbonamento).
-        "accesso_negato": bloccato,
+        "accesso_negato": bool(result.get("Blocked")),
         "formato": "html" if testo else None,
         "testo_integrale": testo,
         "id_precedente": result.get("DocumentIdPrev") or None,
         "id_successivo": result.get("DocumentIdNext") or None,
     }
 
-    if testo or bloccato:
+
+def _stesso_titolo(a: Optional[str], b: Optional[str]) -> bool:
+    if not a or not b:
+        return False
+    norm = lambda t: re.sub(r"\s+", " ", t).strip().lower()
+    return norm(a) == norm(b)
+
+
+async def _cerca_gemello_html(risposta: dict, token: str) -> Optional[dict]:
+    """Molte sentenze sono pubblicate due volte, una in PDF e una in HTML,
+    con lo stesso titolo e id adiacenti (es. 44883625 PDF / 44890439 HTML,
+    osservato il 03/11/2026). La versione HTML è preferibile: testo pulito e
+    nomi delle parti oscurati. La cerchiamo tra il documento precedente e il
+    successivo, accettandola solo se il titolo coincide."""
+    for chiave in ("id_successivo", "id_precedente"):
+        id_vicino = risposta.get(chiave)
+        if not id_vicino or not _ID_DOCUMENTO_RE.match(str(id_vicino)):
+            continue
+        esito = await _chiama_get_document(str(id_vicino), token)
+        if "result" not in esito:
+            continue
+        vicino = _risposta_da_result(esito["result"])
+        if (vicino["testo_integrale"] and not vicino["accesso_negato"]
+                and _stesso_titolo(vicino["titolo"], risposta["titolo"])):
+            return vicino
+    return None
+
+
+async def _get_document(id_documento: str) -> dict:
+    id_documento = str(id_documento).strip()
+    if not _ID_DOCUMENTO_RE.match(id_documento):
+        return {"errore": "idDocumento non valido: deve essere un numero (es. 45464265), "
+                          "preso da un risultato di cerca_smartlex24."}
+
+    try:
+        token = await ensure_session()
+    except LoginError as e:
+        return {"errore": str(e)}
+
+    esito = await _chiama_get_document(id_documento, token)
+    if "result" not in esito:
+        return esito
+    result = esito["result"]
+    risposta = _risposta_da_result(result)
+
+    if risposta["testo_integrale"] or risposta["accesso_negato"]:
         return risposta
 
     # Testo vuoto e documento non bloccato: quasi sempre un "Integrale in PDF".
@@ -554,22 +664,36 @@ async def _get_document(id_documento: str) -> dict:
     dedotto = url_pdf is None
     if dedotto:
         url_pdf = _url_pdf_dedotto(id_documento)
-    pdf = await _scarica_testo_pdf(url_pdf)
 
+    gemello = await _cerca_gemello_html(risposta, token)
+    if gemello:
+        gemello["id_richiesto"] = risposta["idDocumento"]
+        gemello["url_pdf"] = url_pdf
+        gemello["nota"] = (
+            f"Il documento richiesto ({risposta['idDocumento']}) è disponibile solo in PDF: "
+            f"questo è il testo della versione HTML della stessa decisione "
+            f"(idDocumento {gemello['idDocumento']}, stesso titolo), con i nomi delle "
+            "parti oscurati. L'originale firmato è in url_pdf."
+        )
+        return gemello
+
+    pdf = await _scarica_testo_pdf(url_pdf)
     risposta["formato"] = "pdf"
     risposta["url_pdf"] = url_pdf
     risposta["url_pdf_dedotto"] = dedotto
     if "testo" in pdf:
         risposta["testo_integrale"] = pdf["testo"]
         risposta["testo_troncato"] = pdf["troncato"]
-        risposta["nota"] = "Testo estratto automaticamente dal PDF: impaginazione e " \
-                           "a capo possono essere imperfetti."
+        risposta["nota"] = (
+            "Testo estratto automaticamente dal PDF (impaginazione e a capo possono "
+            "essere imperfetti). ATTENZIONE: il PDF è l'originale e può contenere i nomi "
+            "delle parti non oscurati: non riportarli in atti o testi destinati a terzi."
+        )
     else:
         risposta["nota"] = (
             "Il testo integrale è disponibile solo in PDF e non è stato possibile "
             f"estrarlo ({pdf['errore_pdf']}). Il testo vuoto NON significa documento "
-            "senza contenuto: apri url_pdf, oppure prova id_precedente/id_successivo, "
-            "che a volte sono la versione HTML della stessa decisione."
+            "senza contenuto: apri url_pdf."
         )
     return risposta
 
@@ -685,9 +809,14 @@ async def leggi_documento_smartlex24(id_documento: str) -> dict:
 
     - "accesso_negato": true -> documento non incluso nell'abbonamento,
       "testo_integrale" vuoto.
-    - "formato": "pdf" -> il testo è stato estratto dal PDF (vedi
-      "url_pdf"); se l'estrazione non è riuscita, "nota" lo spiega e
-      "testo_integrale" è vuoto: NON significa documento senza contenuto.
+    - Documento disponibile solo in PDF: se esiste la versione HTML della
+      stessa decisione (documento adiacente con lo stesso titolo) viene
+      restituita quella, con "id_richiesto" e "url_pdf" dell'originale;
+      altrimenti "formato": "pdf" e il testo è estratto dal PDF, che può
+      contenere i nomi delle parti NON oscurati. Se l'estrazione non è
+      riuscita, "nota" lo spiega e "testo_integrale" è vuoto: NON significa
+      documento senza contenuto.
+    - Schede senza idDocumento ("apribile": false) non si possono leggere.
 
     Args:
         id_documento: l'idDocumento numerico di un risultato di cerca_smartlex24.
